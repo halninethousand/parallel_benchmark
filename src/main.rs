@@ -7,6 +7,13 @@ const WIDTH: usize = 5120;
 const HEIGHT: usize = 2880;
 const THREAD_COUNT: usize = 4;
 
+const REAL_MIN: f64 = -2.5;
+const REAL_SPAN: f64 = 3.5;
+// Match the complex-plane aspect ratio to the 16:9 pixel grid so a unit of
+// distance has the same size horizontally and vertically in the PNG.
+const IMAGINARY_SPAN: f64 = REAL_SPAN * HEIGHT as f64 / WIDTH as f64;
+const IMAGINARY_MIN: f64 = -IMAGINARY_SPAN / 2.0;
+
 #[derive(Clone, Copy)]
 struct Complex {
     re: f64,
@@ -26,8 +33,8 @@ fn calculate_rows(pixels: &mut [u16], start_y: usize, end_y: usize) {
     for y in start_y..end_y {
         for x in 0..WIDTH {
             let c = Complex {
-                re: -2.5 + (x as f64 / WIDTH as f64) * 3.5,
-                im: -1.5 + (y as f64 / HEIGHT as f64) * 3.0,
+                re: REAL_MIN + (x as f64 / WIDTH as f64) * REAL_SPAN,
+                im: IMAGINARY_MIN + (y as f64 / HEIGHT as f64) * IMAGINARY_SPAN,
             };
 
             let mut z = Complex { re: 0.0, im: 0.0 };
