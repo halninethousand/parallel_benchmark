@@ -1,8 +1,8 @@
-use image::{GrayImage, Luma};
+use image::{ImageBuffer, Luma};
 use std::thread;
 use std::time::Instant;
 
-const MAX_ITERATIONS: u8 = 255;
+const MAX_ITERATIONS: u16 = 512;
 const WIDTH: usize = 4000;
 const HEIGHT: usize = 4000;
 const THREAD_COUNT: usize = 4;
@@ -22,7 +22,7 @@ fn square_complex(z: Complex) -> Complex {
 
 // `pixels` contains rows start_y..end_y, rather than necessarily the whole image.
 // That lets each thread receive exclusive access to just its own rows.
-fn calculate_rows(pixels: &mut [u8], start_y: usize, end_y: usize) {
+fn calculate_rows(pixels: &mut [u16], start_y: usize, end_y: usize) {
     for y in start_y..end_y {
         for x in 0..WIDTH {
             let c = Complex {
@@ -53,7 +53,7 @@ fn calculate_rows(pixels: &mut [u8], start_y: usize, end_y: usize) {
     }
 }
 
-fn calculate_parallel(pixels: &mut [u8], thread_count: usize) {
+fn calculate_parallel(pixels: &mut [u16], thread_count: usize) {
     // More workers than rows would only create empty jobs
     let worker_count = thread_count.clamp(1, HEIGHT);
     let rows_per_worker = HEIGHT.div_ceil(worker_count);
@@ -75,8 +75,8 @@ fn calculate_parallel(pixels: &mut [u8], thread_count: usize) {
 
 fn main() {
     // Allocate before either timer so allocation is not part of the benchmark.
-    let mut single_thread_pixels = vec![0u8; WIDTH * HEIGHT];
-    let mut parallel_pixels = vec![0u8; WIDTH * HEIGHT];
+    let mut single_thread_pixels = vec![0u16; WIDTH * HEIGHT];
+    let mut parallel_pixels = vec![0u16; WIDTH * HEIGHT];
 
     let single_thread_start = Instant::now();
     calculate_rows(&mut single_thread_pixels, 0, HEIGHT);
@@ -118,12 +118,17 @@ fn main() {
 
     let start_write_png = Instant::now();
 
-    let mut image = GrayImage::new(WIDTH as u32, HEIGHT as u32);
+    let mut image = ImageBuffer::<Luma<u16>, Vec<u16>>::new(WIDTH as u32, HEIGHT as u32);
 
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
             let value = parallel_pixels[y * WIDTH + x];
-            image.put_pixel(x as u32, y as u32, Luma([value]));
+            // Rendering is separate from the benchmark: map the raw iteration
+            // count to the full 16-bit grayscale range for a visible PNG.
+            let scaled_value = u32::from(value) * u32::from(u16::MAX) / u32::from(MAX_ITERATIONS);
+            let grayscale_value =
+                u16::try_from(scaled_value).expect("scaled grayscale value must fit in u16");
+            image.put_pixel(x as u32, y as u32, Luma([grayscale_value]));
         }
     }
 
