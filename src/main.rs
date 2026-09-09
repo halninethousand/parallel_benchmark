@@ -1,9 +1,11 @@
 use image::{GrayImage, Luma};
+use std::thread;
 use std::time::Instant;
 
 const MAX_ITERATIONS: u8 = 255;
 const WIDTH: usize = 4000;
 const HEIGHT: usize = 4000;
+const THREAD_COUNT: usize = 4;
 
 #[derive(Clone, Copy)]
 struct Complex {
@@ -18,6 +20,8 @@ fn square_complex(z: Complex) -> Complex {
     }
 }
 
+// `pixels` contains rows start_y..end_y, rather than necessarily the whole image.
+// That lets each thread receive exclusive access to just its own rows.
 fn calculate_rows(pixels: &mut [u8], start_y: usize, end_y: usize) {
     for y in start_y..end_y {
         for x in 0..WIDTH {
@@ -43,32 +47,73 @@ fn calculate_rows(pixels: &mut [u8], start_y: usize, end_y: usize) {
                 iterations += 1;
             }
 
-            pixels[y * WIDTH + x] = iterations;
+            let local_y = y - start_y;
+            pixels[local_y * WIDTH + x] = iterations;
         }
     }
 }
 
+fn calculate_parallel(pixels: &mut [u8], thread_count: usize) {
+    // More workers than rows would only create empty jobs
+    let worker_count = thread_count.clamp(1, HEIGHT);
+    let rows_per_worker = HEIGHT.div_ceil(worker_count);
+    let pixels_per_worker = rows_per_worker * WIDTH;
+
+    // Scoped threads may borrow `pixels`. Ordinary `thread::spawn` requires
+    // `'static` data, which would not allow these borrowed slices.
+    thread::scope(|scope| {
+        for (worker_index, worker_pixels) in pixels.chunks_mut(pixels_per_worker).enumerate() {
+            let start_y = worker_index * rows_per_worker;
+            let end_y = (start_y + rows_per_worker).min(HEIGHT);
+
+            scope.spawn(move || {
+                calculate_rows(worker_pixels, start_y, end_y);
+            });
+        }
+    });
+}
+
 fn main() {
-    let mut pixels = vec![0u8; WIDTH * HEIGHT];
+    // Allocate before either timer so allocation is not part of the benchmark.
+    let mut single_thread_pixels = vec![0u8; WIDTH * HEIGHT];
+    let mut parallel_pixels = vec![0u8; WIDTH * HEIGHT];
 
-    let start = Instant::now();
+    let single_thread_start = Instant::now();
+    calculate_rows(&mut single_thread_pixels, 0, HEIGHT);
+    let single_thread_time = single_thread_start.elapsed();
 
-    calculate_rows(&mut pixels, 0, HEIGHT);
+    let parallel_start = Instant::now();
+    calculate_parallel(&mut parallel_pixels, THREAD_COUNT);
+    let parallel_time = parallel_start.elapsed();
 
-    let calculation_time = start.elapsed();
+    // This happens after both timers and confirms the two implementations agree.
+    assert_eq!(single_thread_pixels, parallel_pixels);
 
     println!("=== Mandelbrot Benchmark ===");
     println!("Resolution:       {} x {}", WIDTH, HEIGHT);
     println!("Pixels:           {}", WIDTH * HEIGHT);
     println!("Max iterations:   {}", MAX_ITERATIONS);
-    println!("Threads:          1");
-    println!("Calculation time: {:.3?}", calculation_time);
+    println!("Single-thread calculation: {:.3?}", single_thread_time);
+    println!(
+        "Parallel calculation ({} threads): {:.3?}",
+        THREAD_COUNT, parallel_time
+    );
 
-    let pixels_per_second = (WIDTH * HEIGHT) as f64 / calculation_time.as_secs_f64();
+    let single_thread_pixels_per_second =
+        (WIDTH * HEIGHT) as f64 / single_thread_time.as_secs_f64();
+    let parallel_pixels_per_second = (WIDTH * HEIGHT) as f64 / parallel_time.as_secs_f64();
 
     println!(
-        "Pixels/sec:       {:.2} million",
-        pixels_per_second / 1_000_000.0
+        "Single-thread rate: {:.2} million pixels/sec",
+        single_thread_pixels_per_second / 1_000_000.0
+    );
+    println!(
+        "Parallel rate:      {:.2} million pixels/sec",
+        parallel_pixels_per_second / 1_000_000.0
+    );
+    println!(
+        "Speedup:            {:.2}x",
+        single_thread_time.as_secs_f64() / parallel_time.as_secs_f64()
     );
 
     let start_write_png = Instant::now();
@@ -77,7 +122,7 @@ fn main() {
 
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
-            let value = pixels[y * WIDTH + x];
+            let value = parallel_pixels[y * WIDTH + x];
             image.put_pixel(x as u32, y as u32, Luma([value]));
         }
     }
