@@ -3,8 +3,8 @@ use std::thread;
 use std::time::Instant;
 
 const MAX_ITERATIONS: u16 = 512;
-const WIDTH: usize = 4000;
-const HEIGHT: usize = 4000;
+const WIDTH: usize = 5120;
+const HEIGHT: usize = 2880;
 const THREAD_COUNT: usize = 4;
 
 #[derive(Clone, Copy)]
@@ -123,8 +123,7 @@ fn main() {
     for y in 0..HEIGHT {
         for x in 0..WIDTH {
             let value = parallel_pixels[y * WIDTH + x];
-            // Rendering is separate from the benchmark: map the raw iteration
-            // count to the full 16-bit grayscale range for a visible PNG.
+            // 16-bit grayscale value.
             let scaled_value = u32::from(value) * u32::from(u16::MAX) / u32::from(MAX_ITERATIONS);
             let grayscale_value =
                 u16::try_from(scaled_value).expect("scaled grayscale value must fit in u16");
