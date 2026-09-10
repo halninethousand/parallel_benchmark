@@ -127,45 +127,40 @@ fn main() {
     println!("Resolution:       {} x {}", WIDTH, HEIGHT);
     println!("Pixels:           {}", WIDTH * HEIGHT);
     println!("Max iterations:   {}", MAX_ITERATIONS);
-    println!("Single-thread calculation: {:.3?}", single_thread_time);
-    println!(
-        "Parallel calculation ({} threads): {:.3?}",
-        THREAD_COUNT, parallel_time
-    );
 
     let single_thread_pixels_per_second =
         (WIDTH * HEIGHT) as f64 / single_thread_time.as_secs_f64();
     let parallel_pixels_per_second = (WIDTH * HEIGHT) as f64 / parallel_time.as_secs_f64();
+    let rayon_pixels_per_second = (WIDTH * HEIGHT) as f64 / rayon_time.as_secs_f64();
 
+    println!("\n--- Single-threaded baseline ---");
+    println!("Calculation time:  {:.3?}", single_thread_time);
     println!(
-        "Single-thread rate: {:.2} million pixels/sec",
+        "Pixels/sec:        {:.2} million",
         single_thread_pixels_per_second / 1_000_000.0
     );
+
+    println!("\n--- std::thread ({} workers) ---", THREAD_COUNT);
+    println!("Calculation time:  {:.3?}", parallel_time);
     println!(
-        "Parallel rate:      {:.2} million pixels/sec",
+        "Pixels/sec:        {:.2} million",
         parallel_pixels_per_second / 1_000_000.0
     );
     println!(
-        "Speedup:            {:.2}x",
+        "Speedup:           {:.2}x",
         single_thread_time.as_secs_f64() / parallel_time.as_secs_f64()
     );
 
-    let rayon_pixels_per_second = (WIDTH * HEIGHT) as f64 / rayon_time.as_secs_f64();
-
+    println!("\n--- Rayon ({} workers) ---", THREAD_COUNT);
+    println!("Calculation time:  {:.3?}", rayon_time);
     println!(
-        "Rayon calculation ({} threads): {:.3?}",
-        THREAD_COUNT, rayon_time
-    );
-    println!(
-        "Rayon rate:         {:.2} million pixels/sec",
+        "Pixels/sec:        {:.2} million",
         rayon_pixels_per_second / 1_000_000.0
     );
     println!(
-        "Rayon speedup:      {:.2}x",
+        "Speedup:           {:.2}x",
         single_thread_time.as_secs_f64() / rayon_time.as_secs_f64()
     );
-
-    let start_write_png = Instant::now();
 
     let mut image = ImageBuffer::<Luma<u16>, Vec<u16>>::new(WIDTH as u32, HEIGHT as u32);
 
@@ -181,8 +176,4 @@ fn main() {
     }
 
     image.save("mandelbrot.png").unwrap();
-
-    let write_time = start_write_png.elapsed();
-
-    println!("PNG write time:   {:.3?}", write_time);
 }
