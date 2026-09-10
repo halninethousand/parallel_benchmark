@@ -2,13 +2,13 @@ use image::{ImageBuffer, Luma};
 use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::thread;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 const MAX_ITERATIONS: u16 = 512;
 const WIDTH: usize = 5120;
 const HEIGHT: usize = 2880;
-// 5800X3D performance cutoff is at 32 os threads
-const THREAD_COUNT: usize = 32;
+const DEFAULT_THREADS: usize = 32;
+const DEFAULT_RUNS: usize = 1;
 
 const REAL_MIN: f64 = -2.5;
 const REAL_SPAN: f64 = 3.5;
@@ -16,6 +16,101 @@ const REAL_SPAN: f64 = 3.5;
 // distance has the same size horizontally and vertically in the PNG
 const IMAGINARY_SPAN: f64 = REAL_SPAN * HEIGHT as f64 / WIDTH as f64;
 const IMAGINARY_MIN: f64 = -IMAGINARY_SPAN / 2.0;
+
+struct Config {
+    threads: usize,
+    runs: usize,
+}
+
+struct Statistics {
+    minimum: Duration,
+    median: Duration,
+    mean: Duration,
+}
+
+fn parse_positive_usize(value: String, argument: &str) -> usize {
+    let parsed = value
+        .parse::<usize>()
+        .unwrap_or_else(|_| panic!("{argument} must be a positive whole number"));
+
+    assert!(parsed > 0, "{argument} must be greater than zero");
+    parsed
+}
+
+fn parse_config() -> Config {
+    let mut config = Config {
+        threads: DEFAULT_THREADS,
+        runs: DEFAULT_RUNS,
+    };
+    let mut arguments = std::env::args().skip(1);
+
+    while let Some(argument) = arguments.next() {
+        match argument.as_str() {
+            "--threads" => {
+                let value = arguments
+                    .next()
+                    .unwrap_or_else(|| panic!("--threads requires a value"));
+                config.threads = parse_positive_usize(value, "--threads");
+            }
+            "--runs" => {
+                let value = arguments
+                    .next()
+                    .unwrap_or_else(|| panic!("--runs requires a value"));
+                config.runs = parse_positive_usize(value, "--runs");
+            }
+            "--help" | "-h" => {
+                println!("Usage: cargo run --release -- [--threads N] [--runs N]");
+                std::process::exit(0);
+            }
+            _ => panic!("unknown argument: {argument}"),
+        }
+    }
+
+    config
+}
+
+fn calculate_statistics(times: &[Duration]) -> Statistics {
+    let mut sorted_times = times.to_vec();
+    sorted_times.sort_unstable();
+
+    let middle = sorted_times.len() / 2;
+    let median = if sorted_times.len() % 2 == 0 {
+        Duration::from_secs_f64(
+            (sorted_times[middle - 1].as_secs_f64() + sorted_times[middle].as_secs_f64()) / 2.0,
+        )
+    } else {
+        sorted_times[middle]
+    };
+    let mean = Duration::from_secs_f64(
+        times.iter().map(Duration::as_secs_f64).sum::<f64>() / times.len() as f64,
+    );
+
+    Statistics {
+        minimum: sorted_times[0],
+        median,
+        mean,
+    }
+}
+
+fn print_statistics(title: &str, statistics: &Statistics, baseline_median: Option<Duration>) {
+    let pixels_per_second = (WIDTH * HEIGHT) as f64 / statistics.median.as_secs_f64();
+
+    println!("\n--- {title} ---");
+    println!("Minimum time:      {:.3?}", statistics.minimum);
+    println!("Median time:       {:.3?}", statistics.median);
+    println!("Mean time:         {:.3?}", statistics.mean);
+    println!(
+        "Median pixels/sec: {:.2} million",
+        pixels_per_second / 1_000_000.0
+    );
+
+    if let Some(baseline) = baseline_median {
+        println!(
+            "Median speedup:    {:.2}x",
+            baseline.as_secs_f64() / statistics.median.as_secs_f64()
+        );
+    }
+}
 
 #[derive(Clone, Copy)]
 struct Complex {
@@ -95,71 +190,70 @@ fn calculate_rayon(pixels: &mut [u16], pool: &ThreadPool) {
 }
 
 fn main() {
+    let config = parse_config();
+
     // Allocate before either timer so allocation is not part of the benchmark.
     let mut single_thread_pixels = vec![0u16; WIDTH * HEIGHT];
     let mut parallel_pixels = vec![0u16; WIDTH * HEIGHT];
-
-    let single_thread_start = Instant::now();
-    calculate_rows(&mut single_thread_pixels, 0, HEIGHT);
-    let single_thread_time = single_thread_start.elapsed();
-
-    let parallel_start = Instant::now();
-    calculate_parallel(&mut parallel_pixels, THREAD_COUNT);
-    let parallel_time = parallel_start.elapsed();
-
-    // This happens after both timers and confirms the two implementations agree.
-    assert_eq!(single_thread_pixels, parallel_pixels);
-
-    // Create the reusable Rayon pool outside the calculation timer.
     let rayon_pool = ThreadPoolBuilder::new()
-        .num_threads(THREAD_COUNT)
+        .num_threads(config.threads)
         .build()
         .unwrap();
 
-    let rayon_start = Instant::now();
-    calculate_rayon(&mut parallel_pixels, &rayon_pool);
-    let rayon_time = rayon_start.elapsed();
+    let mut single_thread_times = Vec::with_capacity(config.runs);
+    let mut std_thread_times = Vec::with_capacity(config.runs);
+    let mut rayon_times = Vec::with_capacity(config.runs);
 
-    // Reusing the buffer is safe because the previous calculation has ended.
-    assert_eq!(single_thread_pixels, parallel_pixels);
+    for run in 0..config.runs {
+        let single_thread_start = Instant::now();
+        calculate_rows(&mut single_thread_pixels, 0, HEIGHT);
+        single_thread_times.push(single_thread_start.elapsed());
+
+        // Alternate the parallel order to reduce a consistent warm-up advantage.
+        if run % 2 == 0 {
+            let std_thread_start = Instant::now();
+            calculate_parallel(&mut parallel_pixels, config.threads);
+            std_thread_times.push(std_thread_start.elapsed());
+            assert_eq!(single_thread_pixels, parallel_pixels);
+
+            let rayon_start = Instant::now();
+            calculate_rayon(&mut parallel_pixels, &rayon_pool);
+            rayon_times.push(rayon_start.elapsed());
+            assert_eq!(single_thread_pixels, parallel_pixels);
+        } else {
+            let rayon_start = Instant::now();
+            calculate_rayon(&mut parallel_pixels, &rayon_pool);
+            rayon_times.push(rayon_start.elapsed());
+            assert_eq!(single_thread_pixels, parallel_pixels);
+
+            let std_thread_start = Instant::now();
+            calculate_parallel(&mut parallel_pixels, config.threads);
+            std_thread_times.push(std_thread_start.elapsed());
+            assert_eq!(single_thread_pixels, parallel_pixels);
+        }
+    }
+
+    let single_thread_statistics = calculate_statistics(&single_thread_times);
+    let std_thread_statistics = calculate_statistics(&std_thread_times);
+    let rayon_statistics = calculate_statistics(&rayon_times);
 
     println!("=== Mandelbrot Benchmark ===");
     println!("Resolution:       {} x {}", WIDTH, HEIGHT);
     println!("Pixels:           {}", WIDTH * HEIGHT);
     println!("Max iterations:   {}", MAX_ITERATIONS);
+    println!("Worker threads:   {}", config.threads);
+    println!("Runs per mode:    {}", config.runs);
 
-    let single_thread_pixels_per_second =
-        (WIDTH * HEIGHT) as f64 / single_thread_time.as_secs_f64();
-    let parallel_pixels_per_second = (WIDTH * HEIGHT) as f64 / parallel_time.as_secs_f64();
-    let rayon_pixels_per_second = (WIDTH * HEIGHT) as f64 / rayon_time.as_secs_f64();
-
-    println!("\n--- Single-threaded baseline ---");
-    println!("Calculation time:  {:.3?}", single_thread_time);
-    println!(
-        "Pixels/sec:        {:.2} million",
-        single_thread_pixels_per_second / 1_000_000.0
+    print_statistics("Single-threaded baseline", &single_thread_statistics, None);
+    print_statistics(
+        &format!("std::thread ({} workers)", config.threads),
+        &std_thread_statistics,
+        Some(single_thread_statistics.median),
     );
-
-    println!("\n--- std::thread ({} workers) ---", THREAD_COUNT);
-    println!("Calculation time:  {:.3?}", parallel_time);
-    println!(
-        "Pixels/sec:        {:.2} million",
-        parallel_pixels_per_second / 1_000_000.0
-    );
-    println!(
-        "Speedup:           {:.2}x",
-        single_thread_time.as_secs_f64() / parallel_time.as_secs_f64()
-    );
-
-    println!("\n--- Rayon ({} workers) ---", THREAD_COUNT);
-    println!("Calculation time:  {:.3?}", rayon_time);
-    println!(
-        "Pixels/sec:        {:.2} million",
-        rayon_pixels_per_second / 1_000_000.0
-    );
-    println!(
-        "Speedup:           {:.2}x",
-        single_thread_time.as_secs_f64() / rayon_time.as_secs_f64()
+    print_statistics(
+        &format!("Rayon ({} workers)", config.threads),
+        &rayon_statistics,
+        Some(single_thread_statistics.median),
     );
 
     let mut image = ImageBuffer::<Luma<u16>, Vec<u16>>::new(WIDTH as u32, HEIGHT as u32);
