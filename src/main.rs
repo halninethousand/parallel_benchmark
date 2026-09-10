@@ -1,16 +1,19 @@
 use image::{ImageBuffer, Luma};
+use rayon::prelude::*;
+use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::thread;
 use std::time::Instant;
 
 const MAX_ITERATIONS: u16 = 512;
 const WIDTH: usize = 5120;
 const HEIGHT: usize = 2880;
-const THREAD_COUNT: usize = 4;
+// 5800X3D performance cutoff is at 32 os threads
+const THREAD_COUNT: usize = 32;
 
 const REAL_MIN: f64 = -2.5;
 const REAL_SPAN: f64 = 3.5;
 // Match the complex-plane aspect ratio to the 16:9 pixel grid so a unit of
-// distance has the same size horizontally and vertically in the PNG.
+// distance has the same size horizontally and vertically in the PNG
 const IMAGINARY_SPAN: f64 = REAL_SPAN * HEIGHT as f64 / WIDTH as f64;
 const IMAGINARY_MIN: f64 = -IMAGINARY_SPAN / 2.0;
 
@@ -80,6 +83,17 @@ fn calculate_parallel(pixels: &mut [u16], thread_count: usize) {
     });
 }
 
+fn calculate_rayon(pixels: &mut [u16], pool: &ThreadPool) {
+    pool.install(|| {
+        // Each item is one row. Rayon can split this work further and let an
+        // idle worker steal remaining rows from a busy worker.
+        pixels
+            .par_chunks_mut(WIDTH)
+            .enumerate()
+            .for_each(|(y, row_pixels)| calculate_rows(row_pixels, y, y + 1));
+    });
+}
+
 fn main() {
     // Allocate before either timer so allocation is not part of the benchmark.
     let mut single_thread_pixels = vec![0u16; WIDTH * HEIGHT];
@@ -94,6 +108,19 @@ fn main() {
     let parallel_time = parallel_start.elapsed();
 
     // This happens after both timers and confirms the two implementations agree.
+    assert_eq!(single_thread_pixels, parallel_pixels);
+
+    // Create the reusable Rayon pool outside the calculation timer.
+    let rayon_pool = ThreadPoolBuilder::new()
+        .num_threads(THREAD_COUNT)
+        .build()
+        .unwrap();
+
+    let rayon_start = Instant::now();
+    calculate_rayon(&mut parallel_pixels, &rayon_pool);
+    let rayon_time = rayon_start.elapsed();
+
+    // Reusing the buffer is safe because the previous calculation has ended.
     assert_eq!(single_thread_pixels, parallel_pixels);
 
     println!("=== Mandelbrot Benchmark ===");
@@ -121,6 +148,21 @@ fn main() {
     println!(
         "Speedup:            {:.2}x",
         single_thread_time.as_secs_f64() / parallel_time.as_secs_f64()
+    );
+
+    let rayon_pixels_per_second = (WIDTH * HEIGHT) as f64 / rayon_time.as_secs_f64();
+
+    println!(
+        "Rayon calculation ({} threads): {:.3?}",
+        THREAD_COUNT, rayon_time
+    );
+    println!(
+        "Rayon rate:         {:.2} million pixels/sec",
+        rayon_pixels_per_second / 1_000_000.0
+    );
+    println!(
+        "Rayon speedup:      {:.2}x",
+        single_thread_time.as_secs_f64() / rayon_time.as_secs_f64()
     );
 
     let start_write_png = Instant::now();
