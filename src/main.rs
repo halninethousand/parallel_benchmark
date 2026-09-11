@@ -3,12 +3,14 @@ use rayon::prelude::*;
 use rayon::{ThreadPool, ThreadPoolBuilder};
 use std::thread;
 use std::time::{Duration, Instant};
+use tokio::runtime::Runtime;
 
 const MAX_ITERATIONS: u16 = 512;
 const WIDTH: usize = 5120;
 const HEIGHT: usize = 2880;
 const DEFAULT_THREADS: usize = 32;
 const DEFAULT_RUNS: usize = 1;
+const TOKIO_TASKS_PER_WORKER: usize = 4;
 
 const REAL_MIN: f64 = -2.5;
 const REAL_SPAN: f64 = 3.5;
@@ -189,6 +191,39 @@ fn calculate_rayon(pixels: &mut [u16], pool: &ThreadPool) {
     });
 }
 
+fn tokio_task_count(worker_count: usize) -> usize {
+    worker_count
+        .saturating_mul(TOKIO_TASKS_PER_WORKER)
+        .clamp(1, HEIGHT)
+}
+
+fn calculate_tokio(pixels: &mut [u16], runtime: &Runtime, worker_count: usize) {
+    let task_count = tokio_task_count(worker_count);
+
+    runtime.block_on(async {
+        let mut handles = Vec::with_capacity(task_count);
+
+        for task_index in 0..task_count {
+            let start_y = task_index * HEIGHT / task_count;
+            let end_y = (task_index + 1) * HEIGHT / task_count;
+            let mut chunk_pixels = vec![0u16; (end_y - start_y) * WIDTH];
+
+            // spawn_blocking requires an owned, 'static closure. Each task
+            // therefore owns its chunk and returns it after calculation.
+            handles.push(tokio::task::spawn_blocking(move || {
+                calculate_rows(&mut chunk_pixels, start_y, end_y);
+                (start_y, chunk_pixels)
+            }));
+        }
+
+        for handle in handles {
+            let (start_y, chunk_pixels) = handle.await.unwrap();
+            let start_pixel = start_y * WIDTH;
+            pixels[start_pixel..start_pixel + chunk_pixels.len()].copy_from_slice(&chunk_pixels);
+        }
+    });
+}
+
 fn main() {
     let config = parse_config();
 
@@ -199,36 +234,42 @@ fn main() {
         .num_threads(config.threads)
         .build()
         .unwrap();
+    let tokio_runtime = tokio::runtime::Builder::new_current_thread()
+        .max_blocking_threads(config.threads)
+        .build()
+        .unwrap();
 
     let mut single_thread_times = Vec::with_capacity(config.runs);
     let mut std_thread_times = Vec::with_capacity(config.runs);
     let mut rayon_times = Vec::with_capacity(config.runs);
+    let mut tokio_times = Vec::with_capacity(config.runs);
 
     for run in 0..config.runs {
         let single_thread_start = Instant::now();
         calculate_rows(&mut single_thread_pixels, 0, HEIGHT);
         single_thread_times.push(single_thread_start.elapsed());
 
-        // Alternate the parallel order to reduce a consistent warm-up advantage.
-        if run % 2 == 0 {
-            let std_thread_start = Instant::now();
-            calculate_parallel(&mut parallel_pixels, config.threads);
-            std_thread_times.push(std_thread_start.elapsed());
-            assert_eq!(single_thread_pixels, parallel_pixels);
+        // Rotate the parallel order to reduce a consistent warm-up advantage.
+        for offset in 0..3 {
+            match (run + offset) % 3 {
+                0 => {
+                    let std_thread_start = Instant::now();
+                    calculate_parallel(&mut parallel_pixels, config.threads);
+                    std_thread_times.push(std_thread_start.elapsed());
+                }
+                1 => {
+                    let rayon_start = Instant::now();
+                    calculate_rayon(&mut parallel_pixels, &rayon_pool);
+                    rayon_times.push(rayon_start.elapsed());
+                }
+                2 => {
+                    let tokio_start = Instant::now();
+                    calculate_tokio(&mut parallel_pixels, &tokio_runtime, config.threads);
+                    tokio_times.push(tokio_start.elapsed());
+                }
+                _ => unreachable!(),
+            }
 
-            let rayon_start = Instant::now();
-            calculate_rayon(&mut parallel_pixels, &rayon_pool);
-            rayon_times.push(rayon_start.elapsed());
-            assert_eq!(single_thread_pixels, parallel_pixels);
-        } else {
-            let rayon_start = Instant::now();
-            calculate_rayon(&mut parallel_pixels, &rayon_pool);
-            rayon_times.push(rayon_start.elapsed());
-            assert_eq!(single_thread_pixels, parallel_pixels);
-
-            let std_thread_start = Instant::now();
-            calculate_parallel(&mut parallel_pixels, config.threads);
-            std_thread_times.push(std_thread_start.elapsed());
             assert_eq!(single_thread_pixels, parallel_pixels);
         }
     }
@@ -236,6 +277,7 @@ fn main() {
     let single_thread_statistics = calculate_statistics(&single_thread_times);
     let std_thread_statistics = calculate_statistics(&std_thread_times);
     let rayon_statistics = calculate_statistics(&rayon_times);
+    let tokio_statistics = calculate_statistics(&tokio_times);
 
     println!("=== Mandelbrot Benchmark ===");
     println!("Resolution:       {} x {}", WIDTH, HEIGHT);
@@ -253,6 +295,15 @@ fn main() {
     print_statistics(
         &format!("Rayon ({} workers)", config.threads),
         &rayon_statistics,
+        Some(single_thread_statistics.median),
+    );
+    print_statistics(
+        &format!(
+            "Tokio spawn_blocking ({} worker limit, {} jobs)",
+            config.threads,
+            tokio_task_count(config.threads)
+        ),
+        &tokio_statistics,
         Some(single_thread_statistics.median),
     );
 
